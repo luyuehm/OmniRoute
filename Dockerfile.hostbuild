@@ -1,0 +1,106 @@
+# OmniRoute host-built Dockerfile
+# Uses the pre-built .build/next/standalone from the host,
+# skipping the OOM-prone Next.js Turbopack build inside Docker.
+# Usage: docker buildx build -f Dockerfile.hostbuild -t omniroute:latest .
+
+# ── Common base with runtime deps (same as original Dockerfile) ──
+FROM node:24-trixie-slim AS base
+WORKDIR /app
+
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=shared \
+  --mount=type=cache,id=apt-lists,target=/var/lib/apt/lists,sharing=shared \
+  apt-get update \
+  && apt-get upgrade -y \
+  && apt-get install -y --no-install-recommends libsecret-1-0 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g npm@latest \
+  && npm cache clean --force
+
+# ── Runner base: copy pre-built standalone from host ──
+FROM base AS runner-base
+
+LABEL org.opencontainers.image.title="omniroute" \
+  org.opencontainers.image.description="Unified AI proxy — route any LLM through one endpoint" \
+  org.opencontainers.image.source="https://github.com/diegosouzapw/OmniRoute"
+
+ENV NODE_ENV=production
+ENV PORT=20128
+ENV HOSTNAME=0.0.0.0
+ENV OMNIROUTE_MEMORY_MB=1024
+ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
+ENV DATA_DIR=/app/data
+ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+
+# Copy the pre-built standalone output (built on host with npm run build)
+# Use --build-context standalone=.build/next/standalone at build time
+COPY --from=standalone . ./
+
+# Select the right better-sqlite3 native binary for THIS container's arch
+# (Linux arm64 on Apple Silicon hosts). The standalone bundle copied above
+# carries prebuilt .node files for every platform under prebuilds/, PLUS a
+# host-built build/Release/better_sqlite3.node that is a Mach-O (macOS) binary
+# when the host build ran on macOS. better-sqlite3's lib/binding.js tries
+# build/Release/ FIRST and only falls back to prebuilds/ if that load fails —
+# but "fails" means the addon is missing entirely; a Mach-O file on Linux
+# throws "invalid ELF header" at dlopen, which better-sqlite3 does NOT catch,
+# so the driver cascade in driverFactory.ts treats better-sqlite3 as broken
+# and falls through to sql.js (WASM, in-memory). sql.js has no WAL and no
+# busy_timeout and rewrites the whole DB file on every persist — the exact
+# cause of the `SqliteError: disk I/O error` lockups under a Docker volume
+# (RIC-468).
+#
+# Fix: drop the host-built build/Release/ tree so binding.js resolves to the
+# prebuilt prebuilds/linux-arm64.node (a real Linux ELF). No compiler needed.
+# The smoke assert confirms the addon loads and opens an in-memory DB before
+# the image ships.
+RUN rm -rf node_modules/better-sqlite3/build/Release \
+  && node -e "require('better-sqlite3')(':memory:').close()"
+
+# Healthcheck script
+COPY scripts/dev/healthcheck.mjs ./healthcheck.mjs
+
+# Ensure permissions
+RUN chown -R node:node /app
+
+EXPOSE 20128
+
+USER node
+
+ENTRYPOINT ["node", "dev/run-standalone.mjs"]
+
+# ── Web variant (with Playwright) ──
+FROM runner-base AS runner-web
+
+USER root
+
+# Copy playwright from the already-installed node_modules
+COPY node_modules/playwright-core ./node_modules/playwright-core
+COPY node_modules/playwright ./node_modules/playwright
+
+ENV PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=apt-lists,target=/var/lib/apt/lists,sharing=locked \
+  apt-get update \
+  && node node_modules/playwright/cli.js install chromium --with-deps \
+  && chown -R node:node /home/node/.cache \
+  && rm -rf /var/lib/apt/lists/*
+
+USER node
+
+# ── CLI variant (with Codex/Claude Code/openclaw) ──
+FROM runner-base AS runner-cli
+
+USER root
+
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,id=apt-lists,target=/var/lib/apt/lists,sharing=locked \
+  apt-get update \
+  && apt-get install -y --no-install-recommends git ca-certificates docker.io docker-compose \
+  && rm -rf /var/lib/apt/lists/* \
+  && git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
+  npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code droid openclaw@latest
+
+USER node
