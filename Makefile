@@ -67,3 +67,7 @@ env-sync: ## Sync .env from .env.example
 
 clean: ## Remove build artifacts
 	rm -rf .build dist coverage .eslintcache
+
+## 构建后缓存清理（2026-11-17）
+post-build-cleanup:
+	@bash ~/.openclaw/workspaces/main/scripts/post-build-cleanup.sh
